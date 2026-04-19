@@ -3,6 +3,16 @@ image:
   tag: latest
   pullPolicy: Always
 
+# Container resources — 512Mi minimum recommended for clusters with 50+ secrets.
+# Unfiltered Secret sources load all cluster secrets into memory for join evaluation.
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 10m
+    memory: 128Mi
+
 # API Server configuration
 apiServer:
   # Enable/disable the embedded API server

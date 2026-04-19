@@ -57,13 +57,10 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
+        {{- with .Values.resources }}
         resources:
-          limits:
-            cpu: 500m
-            memory: 128Mi
-          requests:
-            cpu: 10m
-            memory: 64Mi
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
 {{- if and .Values.apiServer.enabled (eq .Values.apiServer.mode "production") }}
         volumeMounts:
         - name: tls
