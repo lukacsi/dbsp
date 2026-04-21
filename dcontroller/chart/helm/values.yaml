@@ -26,6 +26,16 @@ serviceAccount:
   # Workload Identity, Azure Workload Identity.
   annotations: {}
 
+# RBAC configuration.
+rbac:
+  # "wildcard" (default): manager gets full cluster access. Simple, works
+  #   out-of-the-box for homelabs and single-tenant clusters.
+  # "aggregated": manager's ClusterRole is built from ClusterRoles labeled
+  #   `dcontroller.io/aggregate-to-manager: "true"`. Use this in multi-tenant
+  #   or enterprise environments where operator charts scope their own
+  #   permissions.
+  mode: wildcard
+
 # Container resources — 512Mi minimum recommended for clusters with 50+ secrets.
 # Unfiltered Secret sources load all cluster secrets into memory for join evaluation.
 resources:
