@@ -69,7 +69,12 @@ func (p *Parser) parseValue(v any) (Expression, error) {
 		if strings.HasPrefix(val, "$") && strings.HasPrefix(val, "$[") {
 			return p.callFactory("@get", val)
 		}
-		return p.callFactory("@string", val)
+		// Bare literal string — wrap as @literal so the marshaler can round-
+		// trip values that look like JSONPath but weren't matched above (e.g.
+		// "$$.foo", "$foo"). For ordinary strings this makes no observable
+		// difference: @literal and @string share a runtime, and the marshaler
+		// emits a bare JSON string when the content is unambiguous.
+		return p.callFactory("@literal", val)
 
 	case []any:
 		// Parse as @list with nested expressions.
@@ -195,7 +200,7 @@ func shouldParseScalarStringArg(opName, arg string) bool {
 	}
 
 	switch opName {
-	case "@string", "@get", "@getsub", "@exists":
+	case "@literal", "@get", "@getsub", "@exists":
 		return false
 	default:
 		return true

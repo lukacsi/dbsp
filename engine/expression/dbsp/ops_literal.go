@@ -85,9 +85,15 @@ func (e *floatExpr) Evaluate(ctx *expression.EvalContext) (any, error) {
 
 func (e *floatExpr) String() string { return fmt.Sprintf("@float(%v)", e.operand) }
 
-// stringExpr implements @string.
+// stringExpr implements @string (evaluate + stringify) and @literal (escape).
+// Runtime behavior is identical — the operand is evaluated and coerced to a
+// string. The two operators differ only in how the parser handles a scalar
+// JSONPath-like argument ("$.foo" / "$$.foo"): @string parses it as a @get /
+// @getsub shorthand, @literal keeps it verbatim. The `literal` flag tracks
+// the original operator so the marshaler can round-trip faithfully.
 type stringExpr struct {
 	operand Expression
+	literal bool
 }
 
 func (e *stringExpr) Evaluate(ctx *expression.EvalContext) (any, error) {
@@ -100,13 +106,20 @@ func (e *stringExpr) Evaluate(ctx *expression.EvalContext) (any, error) {
 	}
 	s, err := AsString(value)
 	if err != nil {
-		return nil, fmt.Errorf("@string: %w", err)
+		return nil, fmt.Errorf("%s: %w", e.opName(), err)
 	}
-	ctx.Logger().V(8).Info("eval", "op", "@string", "result", s)
+	ctx.Logger().V(8).Info("eval", "op", e.opName(), "result", s)
 	return s, nil
 }
 
-func (e *stringExpr) String() string { return fmt.Sprintf("@string(%v)", e.operand) }
+func (e *stringExpr) opName() string {
+	if e.literal {
+		return "@literal"
+	}
+	return "@string"
+}
+
+func (e *stringExpr) String() string { return fmt.Sprintf("%s(%v)", e.opName(), e.operand) }
 
 // listExpr implements @list - evaluates each element expression.
 type listExpr struct {
@@ -190,11 +203,24 @@ func init() {
 		}
 		return &floatExpr{operand: &constExpr{value: args}}, nil
 	})
+	// @string evaluates its operand (including JSONPath shorthand) and coerces
+	// the result to string. Symmetric with @int/@float/@bool. Use inside @concat
+	// to inline a numeric or other non-string field value as text.
 	MustRegister("@string", func(args any) (Expression, error) {
 		if e, ok := args.(Expression); ok {
-			return &stringExpr{operand: e}, nil
+			return &stringExpr{operand: e, literal: false}, nil
 		}
-		return &stringExpr{operand: &constExpr{value: args}}, nil
+		return &stringExpr{operand: &constExpr{value: args}, literal: false}, nil
+	})
+	// @literal is the escape form for string values that happen to look like
+	// JSONPath shorthand ("$.x" / "$$.x"). Scalar string args are kept verbatim
+	// by the parser (see shouldParseScalarStringArg) rather than being rewritten
+	// into @get / @getsub. Runtime is identical to @string.
+	MustRegister("@literal", func(args any) (Expression, error) {
+		if e, ok := args.(Expression); ok {
+			return &stringExpr{operand: e, literal: true}, nil
+		}
+		return &stringExpr{operand: &constExpr{value: args}, literal: true}, nil
 	})
 	MustRegister("@list", func(args any) (Expression, error) {
 		if list, ok := args.([]Expression); ok {

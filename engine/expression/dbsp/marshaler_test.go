@@ -69,15 +69,18 @@ var _ = Describe("JSON round-trip", func() {
 			Expect(j2).To(Equal(j1))
 		})
 
-		It("@string with $. prefix stays explicit", func() {
+		It("@literal with $. prefix stays explicit", func() {
+			// NewString builds a @literal expression so that programmatic
+			// callers preserve string-literal semantics for JSONPath-shaped
+			// values. @string itself is the evaluating form.
 			j1, j2 := stableJSON(dbsp.NewString("$.path"))
-			Expect(j1).To(Equal(`{"@string":"$.path"}`))
+			Expect(j1).To(Equal(`{"@literal":"$.path"}`))
 			Expect(j2).To(Equal(j1))
 		})
 
-		It("@string with $$. prefix stays explicit", func() {
+		It("@literal with $$. prefix stays explicit", func() {
 			j1, j2 := stableJSON(dbsp.NewString("$$.path"))
-			Expect(j1).To(Equal(`{"@string":"$$.path"}`))
+			Expect(j1).To(Equal(`{"@literal":"$$.path"}`))
 			Expect(j2).To(Equal(j1))
 		})
 
@@ -247,8 +250,8 @@ var _ = Describe("JSON round-trip", func() {
 			Entry("@int", `42`),
 			Entry("@float", `3.14`),
 			Entry("@string plain", `"hello"`),
-			Entry("@string $.path stays explicit", `{"@string":"$.path"}`),
-			Entry("@string $$.path stays explicit", `{"@string":"$$.path"}`),
+			Entry("@literal $.path stays explicit", `{"@literal":"$.path"}`),
+			Entry("@literal $$.path stays explicit", `{"@literal":"$$.path"}`),
 			Entry("@list", `[1,2]`),
 			Entry("@list empty", `[]`),
 			Entry("@get", `"$.fieldname"`),
