@@ -368,6 +368,109 @@ var _ = Describe("Literal Operators", func() {
 	})
 })
 
+var _ = Describe("Format Operators (@yaml, @json)", func() {
+	It("@json serialises a dict with sorted keys", func() {
+		expr, err := dbsp.Compile([]byte(`{"@json": {"b": 2, "a": 1}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(`{"a":1,"b":2}`))
+	})
+
+	It("@json evaluates JSONPath shorthand inside the operand", func() {
+		expr, err := dbsp.Compile([]byte(
+			`{"@json": {"name": "$.name", "port": "$.port"}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"name": "synapse", "port": int64(5432)})
+		result, err := expr.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(`{"name":"synapse","port":5432}`))
+	})
+
+	It("@yaml serialises a dict with sorted keys at every depth", func() {
+		// Two keys at the top and two nested. Declaration order is
+		// intentionally non-alphabetical to prove we sort.
+		expr, err := dbsp.Compile([]byte(
+			`{"@yaml": {"database": {"port": 5432, "name": "psycopg2"}, "server_name": "m.example.org"}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("database:\n    name: psycopg2\n    port: 5432\nserver_name: m.example.org\n"))
+	})
+
+	It("@yaml is deterministic across runs (same input → identical output)", func() {
+		// Regression guard: Go map iteration order is randomised, so a
+		// naive yaml.Marshal(map[string]any) would produce different output
+		// across runs. Run the same expression 10 times and assert identity.
+		src := []byte(`{"@yaml": {"d": 4, "c": 3, "b": 2, "a": 1, "z": 26}}`)
+		expr, err := dbsp.Compile(src)
+		Expect(err).NotTo(HaveOccurred())
+
+		var first string
+		for i := 0; i < 10; i++ {
+			result, err := expr.Evaluate(expression.NewContext(nil))
+			Expect(err).NotTo(HaveOccurred())
+			s := result.(string)
+			if i == 0 {
+				first = s
+			}
+			Expect(s).To(Equal(first))
+		}
+	})
+
+	It("@yaml preserves sequence order", func() {
+		expr, err := dbsp.Compile([]byte(`{"@yaml": {"items": [3, 1, 2]}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("items:\n    - 3\n    - 1\n    - 2\n"))
+	})
+
+	It("@yaml evaluates nested @concat for value fields", func() {
+		// The canonical use case: build a config file where values come
+		// from field references and expression composition.
+		expr, err := dbsp.Compile([]byte(`{"@yaml": {
+			"host": {"@concat": ["db-", "$.env"]},
+			"port": "$.port"
+		}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"env": "prod", "port": int64(5432)})
+		result, err := expr.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("host: db-prod\nport: 5432\n"))
+	})
+
+	It("@yaml evaluates to empty string on a nil operand", func() {
+		expr, err := dbsp.Compile([]byte(`{"@yaml": null}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(""))
+	})
+
+	It("@json round-trips through Marshal → Compile", func() {
+		expr, err := dbsp.Compile([]byte(`{"@json": {"a": 1, "b": "$.x"}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		data, err := json.Marshal(expr)
+		Expect(err).NotTo(HaveOccurred())
+
+		reparsed, err := dbsp.Compile(data)
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"x": "value"})
+		orig, _ := expr.Evaluate(expression.NewContext(doc))
+		rt, _ := reparsed.Evaluate(expression.NewContext(doc))
+		Expect(rt).To(Equal(orig))
+	})
+})
+
 var _ = Describe("Boolean Operators", func() {
 	It("should evaluate @and with all true", func() {
 		expr, err := dbsp.Compile([]byte(`{"@and": [true, true, true]}`))
