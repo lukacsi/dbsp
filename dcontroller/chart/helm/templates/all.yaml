@@ -293,6 +293,10 @@ kind: ServiceAccount
 metadata:
   name: dcontroller-account
   namespace: dcontroller-system
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -332,173 +336,58 @@ rules:
   - create
   - patch
 ---
+# Manager ClusterRole. Two modes selectable via .Values.rbac.mode:
+#   - "wildcard" (default) — full cluster access, simple, works out-of-the-box
+#   - "aggregated" — rules auto-filled by K8s from ClusterRoles labeled
+#                    `dcontroller.io/aggregate-to-manager: "true"`. Operator
+#                    charts opt-in by creating such a labeled ClusterRole.
+{{- if eq .Values.rbac.mode "aggregated" }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: dcontrollermanager-role
+  name: dcontroller-role
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        dcontroller.io/aggregate-to-manager: "true"
+rules: [] # auto-filled by K8s from aggregated ClusterRoles
+---
+# Base permissions required regardless of which operators are installed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dcontroller-base
+  labels:
+    dcontroller.io/aggregate-to-manager: "true"
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  - pods
-  - secrets
-  - services
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - apisix.apache.org
-  resources:
-  - apisixconsumers
-  - apisixglobalrules
-  - apisixpluginconfigs
-  - apisixroutes
-  - apisixtlses
-  - apisixupstreams
-  - backendtrafficpolicies
-  - consumers
-  - gatewayproxies
-  - httproutepolicies
-  - pluginconfigs
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - apisix.apache.org
-  resources:
-  - apisixconsumers/status
-  - apisixglobalrules/status
-  - apisixpluginconfigs/status
-  - apisixroutes/status
-  - apisixtlses/status
-  - apisixupstreams/status
-  - backendtrafficpolicies/status
-  - consumers/status
-  - httproutepolicies/status
-  verbs:
-  - get
-  - update
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - cache.example.com
-  resources:
-  - memcacheds
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - cache.example.com
-  resources:
-  - memcacheds/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - cache.example.com
-  resources:
-  - memcacheds/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - discovery.k8s.io
-  resources:
-  - endpointslices
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - gateway.networking.k8s.io
-  resources:
-  - gatewayclasses
-  verbs:
-  - get
-  - list
-  - update
-  - watch
-- apiGroups:
-  - gateway.networking.k8s.io
-  resources:
-  - gatewayclasses/status
-  - gateways/status
-  - grpcroutes/status
-  - httproutes/status
-  - referencegrants/status
-  - tcproutes/status
-  - tlsroutes/status
-  - udproutes/status
-  verbs:
-  - get
-  - update
-- apiGroups:
-  - gateway.networking.k8s.io
-  resources:
-  - gateways
-  - grpcroutes
-  - httproutes
-  - referencegrants
-  - tcproutes
-  - tlsroutes
-  - udproutes
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - networking.k8s.io
-  resources:
-  - ingressclasses
-  - ingresses
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - networking.k8s.io
-  resources:
-  - ingresses/status
-  verbs:
-  - get
-  - update
+  - apiGroups: [dcontroller.io]
+    resources: [operators, operators/status, operators/finalizers]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+{{- else }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dcontroller-role
+rules:
+  - apiGroups: [dcontroller.io]
+    resources: [operators, operators/status, operators/finalizers]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

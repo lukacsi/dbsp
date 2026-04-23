@@ -3,6 +3,49 @@ image:
   tag: latest
   pullPolicy: Always
 
+# Image pull secrets for pulling from private registries.
+imagePullSecrets: []
+# - name: my-registry-creds
+
+# Extra annotations / labels applied to the controller Pod.
+podAnnotations: {}
+podLabels: {}
+
+# PriorityClass for the controller Pod. Controllers generally should survive
+# eviction cascades — set to system-cluster-critical on managed clusters.
+priorityClassName: ""
+
+# Pod scheduling constraints.
+tolerations: []
+nodeSelector: {}
+affinity: {}
+
+# ServiceAccount configuration.
+serviceAccount:
+  # Annotations for the controller ServiceAccount — e.g. AWS IRSA, GKE
+  # Workload Identity, Azure Workload Identity.
+  annotations: {}
+
+# RBAC configuration.
+rbac:
+  # "wildcard" (default): manager gets full cluster access. Simple, works
+  #   out-of-the-box for homelabs and single-tenant clusters.
+  # "aggregated": manager's ClusterRole is built from ClusterRoles labeled
+  #   `dcontroller.io/aggregate-to-manager: "true"`. Use this in multi-tenant
+  #   or enterprise environments where operator charts scope their own
+  #   permissions.
+  mode: wildcard
+
+# Container resources — 512Mi minimum recommended for clusters with 50+ secrets.
+# Unfiltered Secret sources load all cluster secrets into memory for join evaluation.
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 10m
+    memory: 128Mi
+
 # API Server configuration
 apiServer:
   # Enable/disable the embedded API server
