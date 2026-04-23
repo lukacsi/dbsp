@@ -17,12 +17,15 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -267,12 +270,45 @@ func runStartServer(_ *cobra.Command, cfg apiServerConfig) error {
 
 	ctx := ctrl.SetupSignalHandler()
 
+	if cfg.probeAddr != "" {
+		startHealthProbeServer(ctx, cfg.probeAddr)
+	}
+
 	setupLog.Info("starting the operator controller")
 	if err := c.Start(ctx); err != nil {
 		setupLog.Error(err, "operator error")
 	}
 
 	return nil
+}
+
+// startHealthProbeServer runs a minimal HTTP server serving /healthz and /readyz
+// on addr in a goroutine. It shuts down when ctx is cancelled.
+func startHealthProbeServer(ctx context.Context, addr string) {
+	mux := http.NewServeMux()
+	ok := func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }
+	mux.HandleFunc("/healthz", ok)
+	mux.HandleFunc("/readyz", ok)
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		setupLog.Info("starting health probe server", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			setupLog.Error(err, "health probe server exited")
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
 }
 
 // ============================================================================
