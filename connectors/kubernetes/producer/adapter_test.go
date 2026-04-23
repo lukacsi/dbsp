@@ -1,13 +1,29 @@
 package producer
 
 import (
+	"encoding/base64"
+	"encoding/json"
+
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	kobject "github.com/l7mp/dbsp/connectors/kubernetes/runtime/object"
 	"github.com/l7mp/dbsp/connectors/kubernetes/runtime/store"
+	"github.com/l7mp/dbsp/engine/datamodel"
+	"github.com/l7mp/dbsp/engine/zset"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
+
+// firstDoc returns the first document of a 1-element ZSet. Tests panic on
+// anything else to keep assertions tight.
+func firstDoc(zs zset.ZSet) datamodel.Document {
+	var out datamodel.Document
+	zs.Iter(func(doc datamodel.Document, _ zset.Weight) bool {
+		out = doc
+		return false
+	})
+	return out
+}
 
 var _ = Describe("Producer adapters", func() {
 	It("converts add/update/delete lifecycle to zset deltas", func() {
@@ -76,6 +92,99 @@ var _ = Describe("Producer adapters", func() {
 		zs, err := p.convertDeltaToZSet(kobject.Delta{Type: kobject.Updated, Object: kobject.DeepCopy(obj)})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(zs.IsZero()).To(BeTrue())
+	})
+
+	It("Secret .data.* is decoded on read, kept base64 on marshal/hash", func() {
+		// Kubernetes serialises Secret values as base64 on the wire.
+		// Pipeline expressions like `$.Secret.data['username']` must see
+		// the decoded plaintext (old dcontroller's behaviour), BUT the
+		// rendered/marshaled form — which is what ends up in processor
+		// and producer flow logs — must stay base64. We achieve both by
+		// wrapping Secrets in a SecretDataAdaptor: GetField decodes,
+		// MarshalJSON/Hash/String go through the base unstructured.
+		p := &baseProducer{sourceCache: map[schema.GroupVersionKind]*store.Store{}}
+
+		username := "synapse"
+		password := "s3cr3t"
+		encUser := base64.StdEncoding.EncodeToString([]byte(username))
+		encPass := base64.StdEncoding.EncodeToString([]byte(password))
+
+		obj := kobject.New()
+		gvk := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"}
+		obj.SetGroupVersionKind(gvk)
+		obj.SetNamespace("default")
+		obj.SetName("db")
+		kobject.SetContent(obj, map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name":      "db",
+				"namespace": "default",
+			},
+			"type": "Opaque",
+			"data": map[string]any{
+				"username": encUser,
+				"password": encPass,
+			},
+		})
+
+		zs, err := p.convertDeltaToZSet(kobject.Delta{Type: kobject.Added, Object: obj})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(zs.Size()).To(Equal(1))
+
+		doc := firstDoc(zs)
+		Expect(doc).NotTo(BeNil())
+
+		// Pipeline-visible form: decoded.
+		user, err := doc.GetField("data.username")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(user).To(Equal(username))
+		pass, err := doc.GetField("data.password")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pass).To(Equal(password))
+
+		// Log-visible form: still base64. Any log sink that calls
+		// MarshalJSON or String() on the zset document sees the raw form.
+		raw, err := doc.MarshalJSON()
+		Expect(err).NotTo(HaveOccurred())
+		var marshaled map[string]any
+		Expect(json.Unmarshal(raw, &marshaled)).To(Succeed())
+		marshaledData := marshaled["data"].(map[string]any)
+		Expect(marshaledData["username"]).To(Equal(encUser))
+		Expect(marshaledData["password"]).To(Equal(encPass))
+		Expect(marshaledData).NotTo(HaveKeyWithValue("username", username))
+		Expect(marshaledData).NotTo(HaveKeyWithValue("password", password))
+
+		// Caller's original object must NOT be mutated.
+		origData := obj.UnstructuredContent()["data"].(map[string]any)
+		Expect(origData["username"]).To(Equal(encUser))
+	})
+
+	It("leaves non-Secret objects as plain Unstructured", func() {
+		// Guard: adaptor wrap is scoped to Secrets only.
+		p := &baseProducer{sourceCache: map[schema.GroupVersionKind]*store.Store{}}
+
+		obj := kobject.New()
+		gvk := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
+		obj.SetGroupVersionKind(gvk)
+		obj.SetNamespace("default")
+		obj.SetName("cfg")
+		encoded := base64.StdEncoding.EncodeToString([]byte("plain"))
+		kobject.SetContent(obj, map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": "cfg", "namespace": "default"},
+			"data":       map[string]any{"looks-like-base64": encoded},
+		})
+
+		zs, err := p.convertDeltaToZSet(kobject.Delta{Type: kobject.Added, Object: obj})
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := firstDoc(zs)
+		Expect(doc).NotTo(BeNil())
+		v, err := doc.GetField("data.looks-like-base64")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(v).To(Equal(encoded))
 	})
 
 	It("uses cached object on delete tombstones", func() {

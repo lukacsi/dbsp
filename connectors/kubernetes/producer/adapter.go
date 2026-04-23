@@ -7,6 +7,8 @@ import (
 
 	kobject "github.com/l7mp/dbsp/connectors/kubernetes/runtime/object"
 	"github.com/l7mp/dbsp/connectors/kubernetes/runtime/store"
+	"github.com/l7mp/dbsp/engine/datamodel"
+	"github.com/l7mp/dbsp/engine/datamodel/adaptor"
 	dbspunstructured "github.com/l7mp/dbsp/engine/datamodel/unstructured"
 	"github.com/l7mp/dbsp/engine/zset"
 )
@@ -74,10 +76,21 @@ func (p *baseProducer) convertDeltaToZSet(delta kobject.Delta) (zset.ZSet, error
 	return zs, nil
 }
 
-func toDocument(obj kobject.Object) *dbspunstructured.Unstructured {
+// toDocument wraps a watched Kubernetes object in the datamodel representation
+// consumed by DBSP pipelines. Secret objects are wrapped in a SecretDataAdaptor
+// so expressions like `$.Secret.data['password']` see the decoded plaintext
+// while the stored document — including Hash(), MarshalJSON(), String(), and
+// any log rendering — keeps the raw base64 form. That keeps credentials out of
+// runtime log streams (processor.send, producer.emit, ...) which verbatim dump
+// zset contents at higher verbosity.
+func toDocument(obj kobject.Object) datamodel.Document {
 	content := kobject.DeepCopyAny(obj.UnstructuredContent()).(map[string]any)
 	unstructured.RemoveNestedField(content, "metadata", "managedFields")
 	unstructured.RemoveNestedField(content, "metadata", "generation")
 
-	return dbspunstructured.New(content, nil)
+	doc := dbspunstructured.New(content, nil)
+	if obj.GetKind() == "Secret" {
+		return adaptor.SecretDataAdaptor(doc)
+	}
+	return doc
 }
