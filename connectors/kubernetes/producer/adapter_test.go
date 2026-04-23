@@ -93,13 +93,15 @@ var _ = Describe("Producer adapters", func() {
 		Expect(zs.IsZero()).To(BeTrue())
 	})
 
-	It("Secret .data.* is eagerly decoded on ingress for all JSONPath forms", func() {
+	It("wraps Secrets so .data.* reads plaintext for every JSONPath form while Hash/JSON stay base64", func() {
 		// Kubernetes serialises Secret values as base64 on the wire.
 		// Pipeline expressions must see plaintext regardless of JSONPath
 		// form (dotted, bracket, rooted) — the previous adaptor-based
 		// approach only matched dotted paths and silently returned base64
 		// for every other form, which is exactly how composite joins
-		// access Secret fields.
+		// access Secret fields. The wrapper also preserves base64 on the
+		// serialised / hashed / logged representation so debug dumps and
+		// zset identity do not leak plaintext.
 		p := &baseProducer{sourceCache: map[schema.GroupVersionKind]*store.Store{}}
 
 		username := "synapse"
@@ -150,8 +152,19 @@ var _ = Describe("Producer adapters", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(pass).To(Equal(password))
 
+		// Hash / JSON / String must emit base64 so that V(2)+ zset dumps
+		// and primary-key identity never surface plaintext secrets.
+		raw, err := doc.MarshalJSON()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(raw)).To(ContainSubstring(encUser))
+		Expect(string(raw)).To(ContainSubstring(encPass))
+		Expect(string(raw)).NotTo(ContainSubstring(username))
+		Expect(string(raw)).NotTo(ContainSubstring(password))
+		Expect(doc.Hash()).To(ContainSubstring(encUser))
+		Expect(doc.Hash()).NotTo(ContainSubstring(password))
+
 		// Caller's original object must NOT be mutated — we deep-copy
-		// before decoding so the informer cache stays intact.
+		// before wrapping so the informer cache stays intact.
 		origData := obj.UnstructuredContent()["data"].(map[string]any)
 		Expect(origData["username"]).To(Equal(encUser))
 		Expect(origData["password"]).To(Equal(encPass))
