@@ -1,6 +1,7 @@
 package producer
 
 import (
+	"encoding/base64"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -8,7 +9,6 @@ import (
 	kobject "github.com/l7mp/dbsp/connectors/kubernetes/runtime/object"
 	"github.com/l7mp/dbsp/connectors/kubernetes/runtime/store"
 	"github.com/l7mp/dbsp/engine/datamodel"
-	"github.com/l7mp/dbsp/engine/datamodel/adaptor"
 	dbspunstructured "github.com/l7mp/dbsp/engine/datamodel/unstructured"
 	"github.com/l7mp/dbsp/engine/zset"
 )
@@ -77,20 +77,42 @@ func (p *baseProducer) convertDeltaToZSet(delta kobject.Delta) (zset.ZSet, error
 }
 
 // toDocument wraps a watched Kubernetes object in the datamodel representation
-// consumed by DBSP pipelines. Secret objects are wrapped in a SecretDataAdaptor
-// so expressions like `$.Secret.data['password']` see the decoded plaintext
-// while the stored document — including Hash(), MarshalJSON(), String(), and
-// any log rendering — keeps the raw base64 form. That keeps credentials out of
-// runtime log streams (processor.send, producer.emit, ...) which verbatim dump
-// zset contents at higher verbosity.
+// consumed by DBSP pipelines. Secret.data values are decoded from base64 on
+// ingress so expressions like `$.Secret.data['password']` see plaintext
+// regardless of JSONPath syntax (dotted, bracket, composite in joins).
+//
+// Note: decoded values flow through the runtime and may appear in V(2)+ debug
+// zset dumps. The right mitigation is to not run production operators at V(2)
+// when watching Secrets; the previous path-matching adaptor gave the illusion
+// of safety but silently failed for every JSONPath form other than dotted.
 func toDocument(obj kobject.Object) datamodel.Document {
 	content := kobject.DeepCopyAny(obj.UnstructuredContent()).(map[string]any)
 	unstructured.RemoveNestedField(content, "metadata", "managedFields")
 	unstructured.RemoveNestedField(content, "metadata", "generation")
 
-	doc := dbspunstructured.New(content, nil)
 	if obj.GetKind() == "Secret" {
-		return adaptor.SecretDataAdaptor(doc)
+		decodeSecretData(content)
 	}
-	return doc
+	return dbspunstructured.New(content, nil)
+}
+
+// decodeSecretData mutates a Secret's content map, base64-decoding every
+// string value under the top-level `data` field. Non-string values and
+// fields that fail to decode are left untouched.
+func decodeSecretData(content map[string]any) {
+	dataField, ok := content["data"].(map[string]any)
+	if !ok {
+		return
+	}
+	for k, v := range dataField {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			continue
+		}
+		dataField[k] = string(raw)
+	}
 }

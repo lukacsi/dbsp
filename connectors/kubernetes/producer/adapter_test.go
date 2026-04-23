@@ -2,7 +2,6 @@ package producer
 
 import (
 	"encoding/base64"
-	"encoding/json"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -94,14 +93,13 @@ var _ = Describe("Producer adapters", func() {
 		Expect(zs.IsZero()).To(BeTrue())
 	})
 
-	It("Secret .data.* is decoded on read, kept base64 on marshal/hash", func() {
+	It("Secret .data.* is eagerly decoded on ingress for all JSONPath forms", func() {
 		// Kubernetes serialises Secret values as base64 on the wire.
-		// Pipeline expressions like `$.Secret.data['username']` must see
-		// the decoded plaintext (old dcontroller's behaviour), BUT the
-		// rendered/marshaled form — which is what ends up in processor
-		// and producer flow logs — must stay base64. We achieve both by
-		// wrapping Secrets in a SecretDataAdaptor: GetField decodes,
-		// MarshalJSON/Hash/String go through the base unstructured.
+		// Pipeline expressions must see plaintext regardless of JSONPath
+		// form (dotted, bracket, rooted) — the previous adaptor-based
+		// approach only matched dotted paths and silently returned base64
+		// for every other form, which is exactly how composite joins
+		// access Secret fields.
 		p := &baseProducer{sourceCache: map[schema.GroupVersionKind]*store.Store{}}
 
 		username := "synapse"
@@ -135,29 +133,28 @@ var _ = Describe("Producer adapters", func() {
 		doc := firstDoc(zs)
 		Expect(doc).NotTo(BeNil())
 
-		// Pipeline-visible form: decoded.
-		user, err := doc.GetField("data.username")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(user).To(Equal(username))
+		// Every JSONPath form the compiler may emit must return plaintext.
+		for _, path := range []string{
+			"data.username",
+			"data['username']",
+			`data["username"]`,
+			"$.data.username",
+			"$.data['username']",
+			`$["data"]["username"]`,
+		} {
+			v, err := doc.GetField(path)
+			Expect(err).NotTo(HaveOccurred(), "path %q", path)
+			Expect(v).To(Equal(username), "path %q", path)
+		}
 		pass, err := doc.GetField("data.password")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(pass).To(Equal(password))
 
-		// Log-visible form: still base64. Any log sink that calls
-		// MarshalJSON or String() on the zset document sees the raw form.
-		raw, err := doc.MarshalJSON()
-		Expect(err).NotTo(HaveOccurred())
-		var marshaled map[string]any
-		Expect(json.Unmarshal(raw, &marshaled)).To(Succeed())
-		marshaledData := marshaled["data"].(map[string]any)
-		Expect(marshaledData["username"]).To(Equal(encUser))
-		Expect(marshaledData["password"]).To(Equal(encPass))
-		Expect(marshaledData).NotTo(HaveKeyWithValue("username", username))
-		Expect(marshaledData).NotTo(HaveKeyWithValue("password", password))
-
-		// Caller's original object must NOT be mutated.
+		// Caller's original object must NOT be mutated — we deep-copy
+		// before decoding so the informer cache stays intact.
 		origData := obj.UnstructuredContent()["data"].(map[string]any)
 		Expect(origData["username"]).To(Equal(encUser))
+		Expect(origData["password"]).To(Equal(encPass))
 	})
 
 	It("leaves non-Secret objects as plain Unstructured", func() {
