@@ -183,6 +183,154 @@ var _ = Describe("Literal Operators", func() {
 		Expect(result).To(Equal("hello"))
 	})
 
+	It("@string evaluates JSONPath shorthand and stringifies the result", func() {
+		// @string is symmetric with @int/@float/@bool: it evaluates its
+		// operand (including scalar JSONPath shorthand like "$.x") and
+		// coerces the result to string. Essential for embedding non-string
+		// fields in @concat.
+		expr, err := dbsp.Compile([]byte(`{"@string": "$.age"}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"age": int64(30)})
+		result, err := expr.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("30"))
+	})
+
+	It("@string stringifies a nested expression result", func() {
+		// @string wrapping an @int (or any other sub-expression) evaluates
+		// the inner expression then stringifies.
+		expr, err := dbsp.Compile([]byte(`{"@string": {"@int": 5432}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("5432"))
+	})
+
+	It("@string embeds a field value inside @concat", func() {
+		// Regression guard for the canonical use case — generating a text
+		// config snippet with a numeric field value inlined.
+		expr, err := dbsp.Compile([]byte(
+			`{"@concat": ["port: ", {"@string": "$.port"}]}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"port": int64(5432)})
+		result, err := expr.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("port: 5432"))
+	})
+
+	It("@literal keeps JSONPath shorthand literal (escape form)", func() {
+		// @literal is the escape form for literal strings that happen to
+		// look like JSONPath shorthand. The parser skip-list keeps the
+		// scalar arg verbatim rather than rewriting it into @get.
+		expr, err := dbsp.Compile([]byte(`{"@literal": "$.age"}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"age": int64(30)})
+		result, err := expr.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("$.age"))
+	})
+
+	It("@literal with a plain string is identical to a bare string", func() {
+		expr, err := dbsp.Compile([]byte(`{"@literal": "hello"}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("hello"))
+	})
+
+	It("@literal preserves a string with $$. prefix", func() {
+		expr, err := dbsp.Compile([]byte(`{"@literal": "$$.subjectpath"}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("$$.subjectpath"))
+	})
+
+	It("@string evaluates to empty on a nil operand", func() {
+		// Matches @int/@float/@bool zero-value semantics on nil.
+		expr, err := dbsp.Compile([]byte(`{"@string": null}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		result, err := expr.Evaluate(expression.NewContext(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(""))
+	})
+
+	It("@string coerces numeric operands to their decimal form", func() {
+		// Guards AsString's int→"42", float→"3.14" behaviour.
+		for input, expected := range map[string]string{
+			`{"@string": 42}`:           "42",
+			`{"@string": 3.14}`:         "3.14",
+			`{"@string": true}`:         "true",
+			`{"@string": {"@int": -7}}`: "-7",
+		} {
+			expr, err := dbsp.Compile([]byte(input))
+			Expect(err).NotTo(HaveOccurred(), input)
+
+			result, err := expr.Evaluate(expression.NewContext(nil))
+			Expect(err).NotTo(HaveOccurred(), input)
+			Expect(result).To(Equal(expected), input)
+		}
+	})
+
+	It("@string evaluates a nested @literal (escape wrapped by cast)", func() {
+		// Verifies composition: @string stringifies whatever its operand
+		// evaluates to, including a @literal inner expression that returns
+		// a JSONPath-shaped string verbatim.
+		expr, err := dbsp.Compile([]byte(
+			`{"@string": {"@literal": "$.age"}}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"age": int64(30)})
+		result, err := expr.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("$.age"))
+	})
+
+	It("@literal round-trips through Marshal → Compile → Evaluate", func() {
+		// Build programmatically, serialise, re-parse, evaluate. Ensures
+		// the escape form survives the full JSON round-trip.
+		expr := dbsp.NewString("$.spec.port")
+		data, err := json.Marshal(expr)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(Equal(`{"@literal":"$.spec.port"}`))
+
+		reparsed, err := dbsp.Compile(data)
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"spec": map[string]any{"port": int64(5432)}})
+		result, err := reparsed.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("$.spec.port")) // still literal after round-trip
+	})
+
+	It("@string round-trips the evaluating form", func() {
+		// Parse → marshal → parse should preserve the evaluating form.
+		// The canonical marshaling of @string wrapping a JSONPath is
+		// {"@string":"$.foo"}, which re-parses to the same evaluate-and-
+		// stringify expression.
+		expr, err := dbsp.Compile([]byte(`{"@string": "$.age"}`))
+		Expect(err).NotTo(HaveOccurred())
+
+		data, err := json.Marshal(expr)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(Equal(`{"@string":"$.age"}`))
+
+		reparsed, err := dbsp.Compile(data)
+		Expect(err).NotTo(HaveOccurred())
+
+		doc := NewTestDoc(map[string]any{"age": int64(30)})
+		result, err := reparsed.Evaluate(expression.NewContext(doc))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal("30"))
+	})
+
 	It("should evaluate @list", func() {
 		expr, err := dbsp.Compile([]byte(`{"@list": [1, 2, 3]}`))
 		Expect(err).NotTo(HaveOccurred())

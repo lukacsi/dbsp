@@ -17,8 +17,12 @@ func NewInt(v int64) Expression { return &intExpr{operand: &constExpr{value: v}}
 // NewFloat creates a float literal expression.
 func NewFloat(v float64) Expression { return &floatExpr{operand: &constExpr{value: v}} }
 
-// NewString creates a string literal expression.
-func NewString(v string) Expression { return &stringExpr{operand: &constExpr{value: v}} }
+// NewString creates a string literal expression. The value is kept verbatim,
+// so round-tripping preserves strings that look like JSONPath shorthand
+// ("$.foo", "$$.foo") via the @literal marshal form.
+func NewString(v string) Expression {
+	return &stringExpr{operand: &constExpr{value: v}, literal: true}
+}
 
 // NewGet creates a field-get expression from a literal field name.
 func NewGet(field string) Expression { return &getExpr{field: &constExpr{value: field}} }

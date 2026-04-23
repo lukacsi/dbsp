@@ -203,9 +203,11 @@ func (e *floatExpr) MarshalJSON() ([]byte, error) {
 }
 func (e *floatExpr) UnmarshalJSON(b []byte) error { return unmarshalInto(b, e) }
 
-// stringExpr: marshals as a bare string when the operand is a constant string that
-// does not start with "$." or "$$." (which would be misread as a @get/@getsub
-// shorthand). Uses {"@string": <operand>} otherwise.
+// stringExpr: marshals as a bare string when the operand is a constant string
+// that does not start with "$." or "$$." (which would be misread as a @get /
+// @getsub shorthand). Otherwise uses {"@literal": <operand>} when the expr
+// was built from @literal (escape form) and {"@string": <operand>} when it
+// was built from @string (evaluate form).
 func (e *stringExpr) MarshalJSON() ([]byte, error) {
 	if c, ok := e.operand.(*constExpr); ok {
 		if s, ok := c.value.(string); ok {
@@ -214,7 +216,7 @@ func (e *stringExpr) MarshalJSON() ([]byte, error) {
 			}
 		}
 	}
-	return marshalUnaryOp("@string", e.operand)
+	return marshalUnaryOp(e.opName(), e.operand)
 }
 func (e *stringExpr) UnmarshalJSON(b []byte) error { return unmarshalInto(b, e) }
 
