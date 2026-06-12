@@ -137,14 +137,14 @@ func (c *ViewCacheInformer) RemoveEventHandler(registration toolscache.ResourceE
 // isInitialList to true if event is an Added as a part of the initial object list. For all event
 // types except Update events the oldObj must not be nil.
 func (c *ViewCacheInformer) TriggerEvent(eventType toolscache.DeltaType, oldObj, newObj object.Object, isInitialList bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	if len(c.handlers) == 0 {
 		c.log.V(4).Info("suppressing event trigger: no handlers", "event", eventType,
 			"object", object.Dump(newObj))
 		return
 	}
-
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
 
 	c.log.V(8).Info("triggering event", "event", eventType, "object", object.Dump(newObj),
 		"isInitial", isInitialList)
