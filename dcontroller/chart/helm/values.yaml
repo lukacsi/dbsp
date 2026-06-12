@@ -69,3 +69,15 @@ apiServer:
       enabled: false
       # Name of the secret containing the certificate
       secretName: ""
+
+# Manager pod resources. Defaults match the previously hardcoded values.
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+# Optional scheduling constraints for the manager pod.
+tolerations: []

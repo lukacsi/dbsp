@@ -72,13 +72,10 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 10
 {{- end }}
+        {{- with .Values.resources }}
         resources:
-          limits:
-            cpu: 500m
-            memory: 128Mi
-          requests:
-            cpu: 10m
-            memory: 64Mi
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
 {{- if and .Values.apiServer.enabled (eq .Values.apiServer.mode "production") }}
         volumeMounts:
         - name: tls
@@ -91,5 +88,9 @@ spec:
         secret:
           secretName: {{ .Values.apiServer.tls.secretName }}
 {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: dcontroller-account
       terminationGracePeriodSeconds: 10
