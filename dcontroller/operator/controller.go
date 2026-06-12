@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
@@ -31,6 +32,12 @@ const (
 	processorComponentName = "operator-controller.processor"
 
 	stopWaitTimeout = 5 * time.Second
+
+	// Failed operator initializations are retried with exponential backoff:
+	// transient startup conditions (API server discovery not ready, CRDs not
+	// yet registered) must never permanently wedge an operator.
+	retryBaseDelay = time.Second
+	retryMaxDelay  = 2 * time.Minute
 )
 
 var (
@@ -158,6 +165,12 @@ type managedOperator struct {
 	done   chan struct{}
 }
 
+type pendingRetry struct {
+	spec    *opv1a1.Operator
+	attempt int
+	timer   *time.Timer
+}
+
 // operatorProcessor is a DBSP runtime processor that translates Operator CR deltas
 // into operator lifecycle operations and status update events.
 type operatorProcessor struct {
@@ -169,6 +182,13 @@ type operatorProcessor struct {
 	mu        sync.Mutex
 	ctx       context.Context
 	operators map[types.NamespacedName]*managedOperator
+
+	// upsertMu serializes operator creation/deletion between Consume and retry
+	// timers. Deliberate head-of-line blocking: a slow operator stop can stall
+	// other operators' lifecycle work for up to stopWaitTimeout.
+	upsertMu sync.Mutex
+	retryMu  sync.Mutex
+	retries  map[types.NamespacedName]*pendingRetry
 
 	log logr.Logger
 }
@@ -199,6 +219,7 @@ func newOperatorProcessor(cfg processorConfig) (*operatorProcessor, error) {
 		outputTopic:   cfg.OutputTopic,
 		k8srt:         cfg.K8sRuntime,
 		operators:     map[types.NamespacedName]*managedOperator{},
+		retries:       map[types.NamespacedName]*pendingRetry{},
 		log:           log.WithName("processor"),
 	}, nil
 }
@@ -228,25 +249,172 @@ func (p *operatorProcessor) Consume(ctx context.Context, in dbspruntime.Event) e
 		actions = append(actions, opAction{op: op, weight: entry.Weight})
 	}
 
-	for _, action := range actions {
-		if action.weight < 0 {
-			p.deleteOperator(client.ObjectKeyFromObject(action.op))
-		}
-	}
-
+	// An update arrives as a {-old, +new} pair: the delete side of a pair must
+	// not tear down retry state, otherwise the status-update echo of a failed
+	// upsert would reset the backoff on every round.
+	upserted := make(map[types.NamespacedName]bool, len(actions))
 	for _, action := range actions {
 		if action.weight > 0 {
-			if err := p.upsertOperator(ctx, action.op); err != nil {
-				status := failedOperatorStatus(action.op.GetGeneration(), err)
-				if pubErr := p.publishStatus(action.op, status); pubErr != nil {
-					return errorsJoin(err, fmt.Errorf("publish failed status: %w", pubErr))
-				}
-				return err
-			}
+			upserted[client.ObjectKeyFromObject(action.op)] = true
 		}
 	}
 
-	return nil
+	for _, action := range actions {
+		if action.weight < 0 {
+			key := client.ObjectKeyFromObject(action.op)
+			if upserted[key] {
+				continue
+			}
+			p.upsertMu.Lock()
+			p.cancelRetry(key)
+			p.deleteOperator(key)
+			p.upsertMu.Unlock()
+		}
+	}
+
+	// A failed upsert must not abort the rest of the batch, and must not
+	// discard the event: schedule a retry so transient conditions (API server
+	// discovery not ready, CRDs not yet registered) cannot wedge the operator.
+	var errs error
+	for _, action := range actions {
+		if action.weight > 0 {
+			errs = errorsJoin(errs, p.tryUpsert(ctx, action.op))
+		}
+	}
+
+	return errs
+}
+
+// tryUpsert attempts the upsert; on failure it publishes a failed status and
+// schedules a retry. A pending retry for an unchanged spec resumes its attempt
+// count (the event was just a status echo), a changed spec restarts the
+// backoff. Holding upsertMu across pop+upsert guarantees a pending retry can
+// never resurrect a spec that a newer event has superseded.
+func (p *operatorProcessor) tryUpsert(ctx context.Context, spec *opv1a1.Operator) error {
+	attempt := 1
+
+	p.upsertMu.Lock()
+	if pending := p.popRetry(client.ObjectKeyFromObject(spec)); pending != nil &&
+		apiequality.Semantic.DeepEqual(pending.spec.Spec, spec.Spec) {
+		attempt = pending.attempt + 1
+	}
+	err := p.upsertOperator(ctx, spec)
+	p.upsertMu.Unlock()
+	if err == nil {
+		return nil
+	}
+
+	status := failedOperatorStatus(spec, err)
+	if pubErr := p.publishStatus(spec, status); pubErr != nil {
+		err = errorsJoin(err, fmt.Errorf("publish failed status: %w", pubErr))
+	}
+
+	if ctx.Err() == nil {
+		p.scheduleRetry(spec, attempt)
+	}
+
+	return err
+}
+
+func (p *operatorProcessor) scheduleRetry(spec *opv1a1.Operator, attempt int) {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := retryMaxDelay
+	if attempt <= 8 {
+		delay = retryBaseDelay << (attempt - 1) // 1s, 2s, ... 128s
+		if delay > retryMaxDelay {
+			delay = retryMaxDelay
+		}
+	}
+
+	key := client.ObjectKeyFromObject(spec)
+
+	p.retryMu.Lock()
+	defer p.retryMu.Unlock()
+	if old, ok := p.retries[key]; ok {
+		old.timer.Stop()
+	}
+	entry := &pendingRetry{spec: spec, attempt: attempt}
+	entry.timer = time.AfterFunc(delay, func() { p.retryUpsert(key) })
+	p.retries[key] = entry
+
+	p.log.Info("scheduling operator retry", "operator", key.String(), "attempt", attempt,
+		"delay", delay.String())
+}
+
+func (p *operatorProcessor) retryUpsert(key types.NamespacedName) {
+	p.mu.Lock()
+	ctx := p.ctx
+	p.mu.Unlock()
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
+
+	p.upsertMu.Lock()
+
+	// Re-check after possibly blocking on upsertMu: a shutdown may have
+	// completed its sweep in the meantime.
+	if ctx.Err() != nil {
+		p.upsertMu.Unlock()
+		return
+	}
+
+	// Validate under upsertMu: an event processed since this timer fired has
+	// cancelled the entry, and a superseded spec must never be resurrected.
+	entry := p.popRetry(key)
+	if entry == nil {
+		p.upsertMu.Unlock()
+		return
+	}
+
+	err := p.upsertOperator(ctx, entry.spec)
+	// Publish and re-schedule outside the critical section (as tryUpsert
+	// does): a blocking publish must not stall other operators' lifecycle.
+	p.upsertMu.Unlock()
+
+	if err == nil {
+		p.log.Info("operator initialized after retry", "operator", key.String(),
+			"attempt", entry.attempt)
+		return
+	}
+
+	status := failedOperatorStatus(entry.spec, err)
+	if pubErr := p.publishStatus(entry.spec, status); pubErr != nil {
+		err = errorsJoin(err, fmt.Errorf("publish failed status: %w", pubErr))
+	}
+	if ctx.Err() == nil {
+		p.scheduleRetry(entry.spec, entry.attempt+1)
+	}
+
+	p.HandleError(fmt.Errorf("retry %d for operator %q: %w", entry.attempt, key.String(), err))
+}
+
+func (p *operatorProcessor) cancelRetry(key types.NamespacedName) {
+	p.popRetry(key)
+}
+
+// popRetry removes and returns the pending retry for the key, stopping its
+// timer; it returns nil if none is pending.
+func (p *operatorProcessor) popRetry(key types.NamespacedName) *pendingRetry {
+	p.retryMu.Lock()
+	defer p.retryMu.Unlock()
+	entry, ok := p.retries[key]
+	if !ok {
+		return nil
+	}
+	entry.timer.Stop()
+	delete(p.retries, key)
+	return entry
+}
+
+func (p *operatorProcessor) cancelAllRetries() {
+	p.retryMu.Lock()
+	defer p.retryMu.Unlock()
+	for key, entry := range p.retries {
+		entry.timer.Stop()
+		delete(p.retries, key)
+	}
 }
 
 func (p *operatorProcessor) upsertOperator(ctx context.Context, spec *opv1a1.Operator) error {
@@ -311,6 +479,13 @@ func (p *operatorProcessor) deleteOperator(key types.NamespacedName) {
 }
 
 func (p *operatorProcessor) stopAllOperators() {
+	// Exclude in-flight retry upserts so the sweep cannot be raced by a timer
+	// that already passed its ctx check.
+	p.upsertMu.Lock()
+	defer p.upsertMu.Unlock()
+
+	p.cancelAllRetries()
+
 	p.mu.Lock()
 	keys := make([]types.NamespacedName, 0, len(p.operators))
 	for key := range p.operators {
@@ -356,15 +531,21 @@ func decodeOperator(doc any) (*opv1a1.Operator, error) {
 	return obj, nil
 }
 
-func failedOperatorStatus(gen int64, err error) opv1a1.OperatorStatus {
-	status := opv1a1.OperatorStatus{}
+// failedOperatorStatus builds a Ready=False status on top of the operator's
+// existing conditions: SetStatusCondition keeps LastTransitionTime stable for
+// an unchanged condition, so repeated failures publish byte-identical status
+// and the API server write becomes a no-op instead of an endless watch echo.
+func failedOperatorStatus(op *opv1a1.Operator, err error) opv1a1.OperatorStatus {
+	status := opv1a1.OperatorStatus{
+		Conditions: append([]metav1.Condition{}, op.Status.Conditions...),
+	}
 	status.LastErrors = []string{err.Error()}
 
 	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 		Type:               string(opv1a1.OperatorConditionReady),
 		Status:             metav1.ConditionFalse,
 		Reason:             string(opv1a1.OperatorReasonNotReady),
-		ObservedGeneration: gen,
+		ObservedGeneration: op.GetGeneration(),
 		LastTransitionTime: metav1.Now(),
 		Message:            "failed to initialize operator",
 	})
