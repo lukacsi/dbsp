@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -100,28 +101,91 @@ func newBase(cfg Config, producerType string) (*baseProducer, error) {
 	return p, nil
 }
 
+// watchRetryDelay backs off before retrying a watch that failed to establish
+// (API server transiently unreachable). A cleanly closed watch channel
+// re-watches immediately.
+const watchRetryDelay = 5 * time.Second
+
+// start runs the producer's watch loop, re-establishing the watch whenever its
+// result channel closes. API server / load-balancer idle timeouts, expired
+// resourceVersions (410 Gone), and network blips all close the channel WITHOUT
+// an error; the previous single-shot implementation returned nil on that close
+// and exited silently, leaving the operator permanently deaf to all events
+// while the process stayed alive and healthy-looking (silent-stall incident
+// 2026-06-13). Re-calling Watch re-delivers the current objects as ADDED, so
+// the engine catches up on adds/updates missed during the gap. Only ctx
+// cancellation stops the loop.
+//
+// KNOWN LIMITATION: objects DELETED during the reconnect gap are not replayed
+// as DELETED (a fresh watch only re-adds what currently exists), so the engine
+// retains a stale entry until that object next changes. A fully correct
+// catch-up would List() on reconnect and synthesize deletions by diffing — a
+// larger change deferred for now; far preferable to the permanent-deafness bug.
 func (p *baseProducer) start(ctx context.Context, onEvent func(context.Context, watch.Event) error) error {
-	w, err := p.client.Watch(ctx, p.newListObject(), p.listOpts...)
-	if err != nil {
-		return fmt.Errorf("producer: watch failed: %w", err)
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		w, err := p.client.Watch(ctx, p.newListObject(), p.listOpts...)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			p.HandleError(fmt.Errorf("producer: watch failed: %w", err))
+			if sleepInterrupted(ctx, watchRetryDelay) {
+				return nil
+			}
+			continue
+		}
+
+		p.log.V(2).Info("watch started")
+		stop, gotEvent := p.consumeWatch(ctx, w, onEvent)
+		if stop {
+			return nil
+		}
+		p.log.V(2).Info("watch channel closed; re-establishing")
+
+		// A watch that established but closed without delivering anything is a
+		// flapping connection (or an empty result set); back off so a sustained
+		// accept-then-drop does not become a hot reconnect loop. A normal watch
+		// always delivers the initial ADDEDs, so this never delays real re-syncs.
+		if !gotEvent && sleepInterrupted(ctx, watchRetryDelay) {
+			return nil
+		}
 	}
+}
+
+// consumeWatch drains a single watch until its result channel closes or ctx is
+// cancelled. stop is true only when the producer should exit (ctx cancelled);
+// a closed channel returns stop=false so start re-establishes the watch.
+// gotEvent reports whether any event was received before the channel closed.
+func (p *baseProducer) consumeWatch(ctx context.Context, w watch.Interface, onEvent func(context.Context, watch.Event) error) (stop, gotEvent bool) {
 	defer w.Stop()
-
-	p.log.V(2).Info("watch started")
-
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return true, gotEvent
 		case evt, ok := <-w.ResultChan():
 			if !ok {
-				return nil
+				return false, gotEvent
 			}
-
+			gotEvent = true
 			if err := onEvent(ctx, evt); err != nil {
 				p.HandleError(err)
 			}
 		}
+	}
+}
+
+// sleepInterrupted waits for d or until ctx is cancelled; it returns true if
+// ctx was cancelled (the caller should stop).
+func sleepInterrupted(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(d):
+		return false
 	}
 }
 
