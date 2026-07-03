@@ -161,6 +161,7 @@ type processorConfig struct {
 
 type managedOperator struct {
 	op     *Operator
+	spec   opv1a1.OperatorSpec
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -291,9 +292,18 @@ func (p *operatorProcessor) Consume(ctx context.Context, in dbspruntime.Event) e
 // backoff. Holding upsertMu across pop+upsert guarantees a pending retry can
 // never resurrect a spec that a newer event has superseded.
 func (p *operatorProcessor) tryUpsert(ctx context.Context, spec *opv1a1.Operator) error {
-	attempt := 1
-
 	p.upsertMu.Lock()
+
+	// A MODIFIED event carrying the same spec as the already-running operator
+	// is a status echo (our own publishStatus write re-triggering the watcher).
+	// Recreating the operator would re-list every source as ADDED and re-publish
+	// status, looping. Skip when the running spec is unchanged.
+	if p.runningSpecUnchanged(spec) {
+		p.upsertMu.Unlock()
+		return nil
+	}
+
+	attempt := 1
 	if pending := p.popRetry(client.ObjectKeyFromObject(spec)); pending != nil &&
 		apiequality.Semantic.DeepEqual(pending.spec.Spec, spec.Spec) {
 		attempt = pending.attempt + 1
@@ -314,6 +324,17 @@ func (p *operatorProcessor) tryUpsert(ctx context.Context, spec *opv1a1.Operator
 	}
 
 	return err
+}
+
+// runningSpecUnchanged reports whether an operator for the key is already
+// running with a spec identical to the incoming one. Must be called under
+// upsertMu (acquires mu in the consistent upsertMu-then-mu order).
+func (p *operatorProcessor) runningSpecUnchanged(spec *opv1a1.Operator) bool {
+	key := client.ObjectKeyFromObject(spec)
+	p.mu.Lock()
+	entry, ok := p.operators[key]
+	p.mu.Unlock()
+	return ok && apiequality.Semantic.DeepEqual(entry.spec, spec.Spec)
 }
 
 func (p *operatorProcessor) scheduleRetry(spec *opv1a1.Operator, attempt int) {
@@ -432,7 +453,7 @@ func (p *operatorProcessor) upsertOperator(ctx context.Context, spec *opv1a1.Ope
 	}
 
 	opCtx, cancel := context.WithCancel(ctx)
-	entry := &managedOperator{op: op, cancel: cancel, done: make(chan struct{})}
+	entry := &managedOperator{op: op, spec: spec.Spec, cancel: cancel, done: make(chan struct{})}
 
 	p.mu.Lock()
 	p.operators[key] = entry
